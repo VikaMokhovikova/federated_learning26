@@ -1,0 +1,29 @@
+в апи были осадкомеры около 2000 мы их не берем потому что нам важны данные по температуре
+
+всретили -1 для дождя и снега 
+а есть где пропущены скорее всего на станции нет датчика снега
+
+если взять все доп переменые и дропнуть на. то будет 65 станций 
+если убрать давление будет 81 старнция и 3220 строк 
+
+How features are transformed for training (answering your second question): Wind 
+direction → components (wu_day, wv_day): wind direction is circular (0° = 360°), so you 
+can't use degrees directly in a linear model. It's decomposed into eastward ( w u = s ⋅ cos ⁡ 
+θ w u =s⋅cosθ) and northward ( w v = s ⋅ sin ⁡ θ w v =s⋅sinθ) components, which are 
+continuous and linear-model-friendly. Z-score standardisation per station: each feature k k 
+at station i i is transformed as: x ~ k ( i ) = x k ( i ) − μ k ( i , train ) σ k ( i , train ) x ~ k (i)  = σ k 
+(i,train)  x k (i)  −μ k (i,train)   Mean and std are computed only on the training set of that 
+station The same parameters are applied to val/test (no leakage) This is critical because 
+stations at different latitudes have very different temperature scales — without 
+normalisation, tmin at Sodankylä (−30 °C winters) would dominate over tmin at Helsinki (−5 
+°C winters) Bias column: a constant 1 is prepended to every feature vector so the model 
+learns an intercept — the linear model is y ^ = w ⊤ x y ^  =w ⊤ x with x 0 = 1 x 0  =1. 
+
+Решение: Использовать Евклидово расстояние с RBF-ядром (Gaussian kernel). Почему не 
+Cosine: Косинусное сходство дает значения от -1 до 1. В формуле GTVMin веса ребер A i j A ij ​ 
+обязаны быть строго ≥ 0 ≥0 , иначе задача перестает быть выпуклой (convex), и алгоритм 
+FedGD (градиентный спуск) просто разойдется (взорвется в бесконечность).
+
+Как показать это в отчете? Построй один график: по оси X — итерации, по оси Y — Loss. Нарисуй кривую для FedGD (плавно падает за 600 шагов) и кривую для FedRelax (падает почти вертикально за 10 шагов).
+
+Вывод: "FedRelax кардинально снижает communication costs (количество раундов связи между станциями), что критически важно для сенсоров с батарейным питанием". Ревьюеры будут в восторге от такого вывода, это чистая суть Federated Learning.

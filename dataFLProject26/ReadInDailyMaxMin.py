@@ -8,7 +8,8 @@ Created on Fri Jan 17 10:48:04 2025
 
 import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone
+UTC = timezone.utc
 import json
 import pandas as pd
 
@@ -106,7 +107,8 @@ end = (datetime.now(UTC) - timedelta(hours=24)).strftime("%Y-%m-%dT00:00:00Z")
 start = (datetime.now(UTC) - timedelta(hours=40 * 24)).strftime("%Y-%m-%dT00:00:00Z")
 
 # Specify the weather parameters
-parameters = "tmin,tmax"  # Example parameters: minimum and maximum temperature
+# tday = daily mean temperature, rrday = precipitation sum, snow = snow depth
+parameters = "tmin,tmax,tday,rrday,snow"
 
 # Define the stored query
 stored_query = "fmi::observations::weather::daily::timevaluepair"
@@ -161,6 +163,13 @@ df_wide.columns.name = None  # drop pandas column index name
 # Optional: stable column order (station meta + sorted parameters)
 param_cols = sorted([c for c in df_wide.columns if c not in {"station", "lat", "lon", "day"}])
 df_wide = df_wide[["station", "lat", "lon", "day"] + param_cols]
+
+# --- Drop rows where core temperature values are missing ---
+# Some FMI stations measure only precipitation/snow but not temperature.
+# These produce rows with NaN in tmax/tmin after the pivot — drop them.
+before = len(df_wide)
+df_wide = df_wide.dropna(subset=["tmax", "tmin"]).reset_index(drop=True)
+print(f"Dropped {before - len(df_wide)} rows with missing tmax/tmin (non-temperature stations)")
 
 # --- Save ---
 out_csv = "daily_records.csv"

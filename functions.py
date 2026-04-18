@@ -3,7 +3,10 @@ functions.py — Federated Learning utilities for FMI temperature prediction.
 
 Project task: each FMI weather station is an FL node.
               We predict tomorrow's daily maximum temperature (tmax_{t+1})
-              from today's [tmin_t, tmax_t] using linear regression at each node.
+              from today's feature vector using linear regression at each node.
+
+              System A (baseline):  x = [1, tmin, tmax]
+              System B (extended):  x = [1, tmin, tmax, tday, rrday, snow, wu, wv, pa]
 
 Sections
 --------
@@ -27,9 +30,32 @@ from typing import Dict, List, Tuple, Optional
 # SECTION 1 — Data loading & preprocessing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_data(path: str) -> pd.DataFrame:
-    """Load daily_records.csv and return a DataFrame sorted by (station, day)."""
+def load_data(path: str, wind_pressure_path: str = None) -> pd.DataFrame:
+    """
+    Load daily_records.csv and optionally merge daily_wind_pressure.csv.
+
+    Parameters
+    ----------
+    path : str
+        Path to daily_records.csv (columns: station, lat, lon, day, tmin, tmax,
+        and optionally tday, rrday, snow after ReadInDailyMaxMin.py is re-run).
+    wind_pressure_path : str, optional
+        Path to daily_wind_pressure.csv produced by GetFMIHourly.py
+        (columns: station, lat, lon, day, ws_day, wu_day, wv_day, pa_day).
+        If provided, it is left-joined onto the main dataframe on (station, day).
+
+    Returns
+    -------
+    DataFrame sorted by (station, day).
+    """
     df = pd.read_csv(path, parse_dates=["day"])
+
+    if wind_pressure_path is not None:
+        wp = pd.read_csv(wind_pressure_path, parse_dates=["day"])
+        # Drop redundant lat/lon from wind file to avoid _x/_y suffixes
+        wp = wp.drop(columns=[c for c in ["lat", "lon"] if c in wp.columns])
+        df = df.merge(wp, on=["station", "day"], how="left")
+
     df = df.sort_values(["station", "day"]).reset_index(drop=True)
     return df
 
@@ -44,34 +70,60 @@ def get_station_meta(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def build_node_datasets(df: pd.DataFrame, min_points: int = 30) -> Dict[str, Dict]:
+def build_node_datasets(
+    df:           pd.DataFrame,
+    min_points:   int       = 30,
+    extra_features: List[str] = None,
+) -> Dict[str, Dict]:
     """
     Build per-station supervised datasets for next-day tmax prediction.
 
     For each station we form consecutive-day pairs:
-        x_t  = [1,  tmin_t,  tmax_t]   (shape: (m_i, 3))   — feature vector
-        y_t  = tmax_{t+1}               (shape: (m_i,))     — label
+        x_t  = [1,  tmin_t,  tmax_t,  <extra_features>_t]  — feature vector
+        y_t  = tmax_{t+1}                                    — label
 
-    The leading `1` is the bias / intercept term so the weight vector
-    w ∈ ℝ³ includes the intercept directly.
+    The leading `1` is the bias / intercept term.
 
-    Only pairs where both days are consecutive (no gap) AND neither tmin/tmax
-    is NaN are included.  Stations with fewer than `min_points` pairs are
-    discarded (too little data to learn anything meaningful).
+    Parameters
+    ----------
+    df : DataFrame with columns station, lat, lon, day, tmin, tmax
+         and optionally: tday, rrday, snow, wu_day, wv_day, pa_day
+    min_points : discard stations with fewer usable pairs than this
+    extra_features : list of additional column names to append to x_t,
+                     e.g. ["tday", "rrday", "snow", "wu_day", "wv_day", "pa_day"].
+                     Missing columns are silently ignored.
+                     NaN values in extra features are forward-filled then
+                     backward-filled within each station before building pairs;
+                     remaining NaNs cause the pair to be dropped.
 
     Returns
     -------
     dict  keyed by station name, each entry:
-        "X"    : np.ndarray (m_i, 3)
-        "y"    : np.ndarray (m_i,)
-        "days" : list of pd.Timestamp  (the t-th day, label is t+1)
-        "lat"  : float
-        "lon"  : float
+        "X"            : np.ndarray (m_i, d)   d = 3 + len(valid extra cols)
+        "y"            : np.ndarray (m_i,)
+        "days"         : list of pd.Timestamp
+        "lat", "lon"   : float
+        "feature_names": list[str]  names of all columns in X
     """
+    if extra_features is None:
+        extra_features = []
+
+    # Only keep extra features that actually exist in the dataframe
+    valid_extras = [c for c in extra_features if c in df.columns]
+
     datasets: Dict[str, Dict] = {}
 
     for station, grp in df.groupby("station"):
-        grp = grp.sort_values("day").dropna(subset=["tmin", "tmax"]).reset_index(drop=True)
+        grp = grp.sort_values("day").reset_index(drop=True)
+
+        # Forward-fill then backward-fill extra features within the station
+        # to handle isolated missing hourly-aggregated values.
+        # tmin/tmax are NOT filled — a missing temperature day is dropped.
+        if valid_extras:
+            grp[valid_extras] = grp[valid_extras].ffill().bfill()
+
+        # Drop rows missing tmin or tmax (core features)
+        grp = grp.dropna(subset=["tmin", "tmax"]).reset_index(drop=True)
         n = len(grp)
         if n < 2:
             continue
@@ -80,27 +132,44 @@ def build_node_datasets(df: pd.DataFrame, min_points: int = 30) -> Dict[str, Dic
         tmax = grp["tmax"].values
         days = grp["day"].tolist()
 
-        # Keep only consecutive-day pairs (gap check)
+        # Extra feature arrays (after filling)
+        extra_arrays = {c: grp[c].values for c in valid_extras}
+
+        # Keep only consecutive-day pairs where all features are non-NaN
         valid = []
         for t in range(n - 1):
             delta = (days[t + 1] - days[t]).days
-            if delta == 1:
-                valid.append(t)
+            if delta != 1:
+                continue
+            # Check extra features at time t are non-NaN
+            if any(np.isnan(extra_arrays[c][t]) for c in valid_extras):
+                continue
+            valid.append(t)
 
         if len(valid) < min_points:
             continue
 
         idx = np.array(valid)
-        X = np.column_stack([np.ones(len(idx)), tmin[idx], tmax[idx]])
+        base_X = np.column_stack([np.ones(len(idx)), tmin[idx], tmax[idx]])
+        feature_names = ["bias", "tmin", "tmax"]
+
+        if valid_extras:
+            extra_cols = np.column_stack([extra_arrays[c][idx] for c in valid_extras])
+            X = np.hstack([base_X, extra_cols])
+            feature_names += valid_extras
+        else:
+            X = base_X
+
         y = tmax[idx + 1]
         day_list = [days[t] for t in idx]
 
         datasets[station] = {
-            "X":    X.astype(np.float64),
-            "y":    y.astype(np.float64),
-            "days": day_list,
-            "lat":  float(grp["lat"].iloc[0]),
-            "lon":  float(grp["lon"].iloc[0]),
+            "X":             X.astype(np.float64),
+            "y":             y.astype(np.float64),
+            "days":          day_list,
+            "lat":           float(grp["lat"].iloc[0]),
+            "lon":           float(grp["lon"].iloc[0]),
+            "feature_names": feature_names,
         }
 
     return datasets
@@ -129,11 +198,88 @@ def chronological_split(
     return node_datasets
 
 
+def add_autoregressive_lags(
+    node_datasets: Dict[str, Dict],
+    lags: List[int] = [1, 2],
+) -> Dict[str, Dict]:
+    """
+    Append autoregressive tmax lag features to each station's dataset.
+
+    For each lag k in `lags`, appends tmax_{t-k} as a new feature column.
+    Because lag-k requires k previous observations, the first k rows of each
+    station are dropped (train/val/test indices are recomputed accordingly).
+
+    This function must be called BEFORE standardize_node_datasets.
+    It creates a fresh dataset dict so the original NODE_DATASETS is unchanged.
+
+    Parameters
+    ----------
+    node_datasets : dict produced by build_node_datasets + chronological_split
+    lags          : list of positive integers, e.g. [1, 2]
+
+    Returns
+    -------
+    New dict with the same structure, X and y trimmed, lags appended to X,
+    feature_names updated, train/val/test indices recomputed from original fractions.
+    """
+    max_lag = max(lags)
+    new_datasets: Dict[str, Dict] = {}
+
+    for name, data in node_datasets.items():
+        X = data["X"]           # (m, d)
+        y = data["y"]           # (m,)
+        m = len(y)
+
+        # tmax is column index 2 in the base feature vector (bias, tmin, tmax, ...)
+        tmax_col = X[:, 2]      # shape (m,)
+
+        # Build lag columns — row t gets tmax_{t-k} = tmax_col[t - k]
+        lag_cols = []
+        lag_names = []
+        for k in lags:
+            col = np.full(m, np.nan)
+            col[k:] = tmax_col[:m - k]
+            lag_cols.append(col)
+            lag_names.append(f"tmax_lag{k}")
+
+        lag_matrix = np.column_stack(lag_cols)   # (m, n_lags)
+        X_aug = np.hstack([X, lag_matrix])        # (m, d + n_lags)
+
+        # Drop first max_lag rows (NaN lags)
+        X_aug = X_aug[max_lag:]
+        y_trim = y[max_lag:]
+        m_new = len(y_trim)
+
+        # Recompute chronological split with same fractions as original
+        n_train_orig = len(data["train_idx"])
+        n_val_orig   = len(data["val_idx"])
+        train_frac   = n_train_orig / m
+        val_frac     = n_val_orig   / m
+        n_train_new  = max(1, int(m_new * train_frac))
+        n_val_new    = max(1, int(m_new * val_frac))
+
+        new_datasets[name] = {
+            "X":             X_aug.astype(np.float64),
+            "y":             y_trim.astype(np.float64),
+            "days":          data["days"][max_lag:],
+            "lat":           data["lat"],
+            "lon":           data["lon"],
+            "feature_names": data["feature_names"] + lag_names,
+            "train_idx":     np.arange(0, n_train_new),
+            "val_idx":       np.arange(n_train_new, n_train_new + n_val_new),
+            "test_idx":      np.arange(n_train_new + n_val_new, m_new),
+        }
+
+    return new_datasets
+
+
 def standardize_node_datasets(node_datasets: Dict[str, Dict]) -> Dict[str, Dict]:
     """
-    Standardise feature columns [tmin, tmax] (columns 1 and 2) using
-    training-set mean and standard deviation.  The bias column (index 0)
-    is left as 1 and is NOT scaled.
+    Standardise all feature columns except the bias (column 0) using
+    training-set mean and standard deviation.
+
+    Works for any feature vector width (System A with 3 features or
+    System B with 9 features — same code, no changes needed).
 
     Standardisation is computed from training data ONLY to prevent leakage.
     The same (mean, std) is then applied to validation and test sets.
@@ -144,8 +290,8 @@ def standardize_node_datasets(node_datasets: Dict[str, Dict]) -> Dict[str, Dict]
         X  = data["X"]
         tr = data["train_idx"]
 
-        x_mean = X[tr, 1:].mean(axis=0)   # shape (2,)
-        x_std  = X[tr, 1:].std(axis=0)    # shape (2,)
+        x_mean = X[tr, 1:].mean(axis=0)   # shape (d-1,), all cols except bias
+        x_std  = X[tr, 1:].std(axis=0)    # shape (d-1,)
         x_std[x_std == 0] = 1.0           # avoid division by zero
 
         X_std = X.copy()
@@ -288,6 +434,153 @@ def build_similarity_graph(
             if corr >= threshold:
                 A[i, j] = A[j, i] = corr
 
+    return A
+
+
+def build_dtw_graph(
+    node_datasets:  Dict[str, Dict],
+    station_names:  List[str],
+    threshold:      float = 0.5,
+) -> np.ndarray:
+    """
+    System B2 — Dynamic Time Warping (DTW) similarity graph.
+
+    Computes pairwise DTW distance between z-score-normalised training tmax
+    series at each station.  Converts distances to similarity weights via an
+    RBF kernel with σ = median pairwise DTW distance, then keeps only edges
+    where the resulting similarity ≥ threshold.
+
+    DTW captures shape similarity even when series are temporally shifted —
+    often stronger than Pearson for temperature series affected by different
+    regional weather-system lags.
+
+    Similarity is computed on TRAINING DATA ONLY to prevent leakage.
+    Requires: dtaidistance  (pip install dtaidistance)
+    """
+    try:
+        from dtaidistance import dtw as _dtw
+    except ImportError:
+        raise ImportError(
+            "Install dtaidistance first:  pip install dtaidistance"
+        )
+
+    n = len(station_names)
+
+    # Build z-score-normalised training tmax series per station
+    series = []
+    for name in station_names:
+        data   = node_datasets[name]
+        tr_idx = data["train_idx"]
+        y      = data["y"][tr_idx].astype(np.float64)
+        std    = y.std()
+        y_norm = (y - y.mean()) / (std if std > 1e-8 else 1.0)
+        series.append(np.ascontiguousarray(y_norm))
+
+    # Pairwise DTW distances
+    # Suppress dtaidistance's "C library not available" print statements
+    import contextlib, io as _io
+    D = np.zeros((n, n))
+    with contextlib.redirect_stdout(_io.StringIO()):
+        for i in range(n):
+            for j in range(i + 1, n):
+                try:
+                    d = float(_dtw.distance_fast(series[i], series[j]))
+                except Exception:
+                    d = float(_dtw.distance(series[i], series[j]))
+                D[i, j] = D[j, i] = d
+
+    # RBF kernel: σ = median pairwise distance
+    off_diag = D[np.triu_indices(n, k=1)]
+    sigma = float(np.median(off_diag))
+    if sigma < 1e-10:
+        sigma = 1.0
+
+    W = np.exp(-(D ** 2) / (sigma ** 2))
+    np.fill_diagonal(W, 0.0)
+
+    # Threshold → sparse adjacency matrix
+    A = np.where(W >= threshold, W, 0.0)
+    return A
+
+
+def build_multivariate_graph(
+    node_datasets:  Dict[str, Dict],
+    station_names:  List[str],
+    k:              int           = 5,
+    sigma:          Optional[float] = None,
+) -> np.ndarray:
+    """
+    System C — Multivariate climate-profile similarity graph.
+
+    For each station i, compute the mean of every feature (excluding the
+    intercept column) over the TRAINING set → a profile vector
+        μ^(i) ∈ ℝ^(d−1)   (d−1 = 7 for the extended feature set).
+
+    These vectors encode the average climate regime of each station
+    (cold/warm, windy/calm, snowy/dry, …).  Stations with similar climate
+    profiles likely benefit from sharing model parameters.
+
+    Construction:
+        1. Profile vectors are globally z-score-normalised so that no single
+           feature dominates the distance.
+        2. Pairwise Euclidean distance  d_ij  is computed between profiles.
+        3. RBF edge weight:  A_ij = exp(−d_ij² / (2σ²)),
+           σ = median pairwise profile distance (data-driven, unit-free).
+        4. Each station is connected to its k nearest-profile neighbours,
+           then symmetrised — same construction as System A but in feature
+           space rather than geographic space.
+
+    The intercept is intentionally excluded: it is a model parameter, not
+    a property of the station's climate.
+
+    Computed on TRAINING DATA ONLY to prevent leakage.
+    """
+    n = len(station_names)
+
+    # Build profile matrix: mean of each non-intercept feature over training
+    profiles = []
+    for name in station_names:
+        data   = node_datasets[name]
+        tr_idx = data["train_idx"]
+        # Use raw (unstandardised) X to get physically meaningful means;
+        # skip column 0 (bias/intercept).
+        x_train = data["X"][tr_idx, 1:]   # shape (m_train, d-1)
+        profiles.append(x_train.mean(axis=0))
+
+    P = np.array(profiles, dtype=np.float64)   # (n, d-1)
+
+    # Global z-score normalisation across stations (per feature)
+    p_mean = P.mean(axis=0)
+    p_std  = P.std(axis=0)
+    p_std[p_std < 1e-10] = 1.0
+    P_norm = (P - p_mean) / p_std             # (n, d-1)
+
+    # Pairwise Euclidean distances between normalised profiles
+    D = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = float(np.linalg.norm(P_norm[i] - P_norm[j]))
+            D[i, j] = D[j, i] = d
+
+    if sigma is None:
+        off_diag = D[np.triu_indices(n, k=1)]
+        sigma = float(np.median(off_diag))
+    if sigma < 1e-10:
+        sigma = 1.0
+
+    # RBF weights
+    W = np.exp(-(D ** 2) / (2.0 * sigma ** 2))
+    np.fill_diagonal(W, 0.0)
+
+    # k-NN connectivity (same as System A)
+    A = np.zeros((n, n))
+    for i in range(n):
+        dist_i      = D[i].copy()
+        dist_i[i]   = np.inf
+        nn_idx      = np.argsort(dist_i)[:k]
+        A[i, nn_idx] = W[i, nn_idx]
+
+    A = np.maximum(A, A.T)   # symmetrize
     return A
 
 
