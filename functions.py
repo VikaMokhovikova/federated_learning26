@@ -5,13 +5,22 @@ Project task: each FMI weather station is an FL node.
               We predict tomorrow's daily maximum temperature (tmax_{t+1})
               from today's feature vector using linear regression at each node.
 
-              System A (baseline):  x = [1, tmin, tmax]
-              System B (extended):  x = [1, tmin, tmax, tday, rrday, snow, wu, wv, pa]
+Feature sets
+------------
+  Base (fl_base.ipynb):  x = [1, tmin, tmax]
+  Full (fl.ipynb):       x = [1, tmin, tmax, tday, rrday, snow, wu, wv]
+
+Graph systems
+-------------
+  System A  — Geographic k-NN (Gaussian kernel of great-circle distance)
+  System B1 — Pearson correlation of training-period tmax series
+  System B2 — DTW similarity of training-period tmax series
+  System C  — Multivariate climate-profile similarity (full dataset only)
 
 Sections
 --------
 1. Data loading & preprocessing
-2. Graph construction  (System A: geographic k-NN;  System B: data similarity)
+2. Graph construction  (Systems A, B1, B2, C)
 3. Local model         (linear regression — MSE loss, gradient, smoothness)
 4. FL algorithms       (FedGD, FedRelax — both implement GTVMin)
 5. Evaluation & hyperparameter tuning
@@ -116,11 +125,19 @@ def build_node_datasets(
     for station, grp in df.groupby("station"):
         grp = grp.sort_values("day").reset_index(drop=True)
 
-        # Forward-fill then backward-fill extra features within the station
-        # to handle isolated missing hourly-aggregated values.
-        # tmin/tmax are NOT filled — a missing temperature day is dropped.
+        # Raise immediately if any extra feature has NaN values.
+        # Silently filling before the train/test split would be incorrect
+        # (it would use future values to impute past ones).
+        # Callers must handle missing extra-feature rows before passing data in.
         if valid_extras:
-            grp[valid_extras] = grp[valid_extras].ffill().bfill()
+            nan_counts = grp[valid_extras].isnull().sum()
+            bad = nan_counts[nan_counts > 0]
+            if not bad.empty:
+                raise ValueError(
+                    f"Station '{station}' has NaN values in extra features "
+                    f"{bad.to_dict()}. Drop or impute them before calling "
+                    f"build_node_datasets()."
+                )
 
         # Drop rows missing tmin or tmax (core features)
         grp = grp.dropna(subset=["tmin", "tmax"]).reset_index(drop=True)
@@ -413,15 +430,17 @@ def build_similarity_graph(
     n = len(station_names)
     A = np.zeros((n, n))
 
-    # Build (day → tmax) series for training period of each station
+    # Build (day → tmax_t) series for training period of each station.
+    # We use the observed tmax_t (feature column index 2: [bias, tmin_t, tmax_t])
+    # rather than y = tmax_{t+1}, so the graph is built purely from input
+    # observations and not from the target variable.
     series: Dict[str, pd.Series] = {}
     for name in station_names:
-        data   = node_datasets[name]
-        tr_idx = data["train_idx"]
-        # Use raw y (tmax_{t+1}) — equivalent to the tmax time series on training days
-        days   = pd.DatetimeIndex([data["days"][i] for i in tr_idx])
-        y_vals = data["y"][tr_idx]
-        series[name] = pd.Series(y_vals, index=days)
+        data       = node_datasets[name]
+        tr_idx     = data["train_idx"]
+        days       = pd.DatetimeIndex([data["days"][i] for i in tr_idx])
+        tmax_vals  = data["X"][tr_idx, 2]   # column 2 = tmax_t (raw, unstandardised)
+        series[name] = pd.Series(tmax_vals, index=days)
 
     for i in range(n):
         for j in range(i + 1, n):
